@@ -1,68 +1,133 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"time"
-	"github.com/monitoring-api-bpjs/config"
+	"strings"
+
+	"github.com/joho/godotenv"
 )
 
-func main() {
-	config := config.LoadConfig()
-
-	for {
-		// Cek status API
-		err := checkAPIStatus(config.APIUrl)
-		if err != nil {
-			// Kirim pesan error ke bot Telegram
-			sendTelegramMessage(config.TelegramBot, config.TelegramChat, err.Error())
-		}
-
-		// Tunggu sebelum memeriksa ulang
-		time.Sleep(5 * time.Minute)
-	}
+// Struct untuk membaca konfigurasi dari environment variables
+type Config struct {
+	APIURL       string
+	TelegramBot  string
+	TelegramChat string
 }
 
-// checkAPIStatus checks the status of the API
-func checkAPIStatus(apiUrl string) error {
-	resp, err := http.Get(apiUrl)
+// Struct untuk mem-parsing respons JSON dari endpoint
+type HealthResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+// Fungsi untuk memuat konfigurasi dari file .env
+func LoadConfig() (*Config, error) {
+	err := godotenv.Load()
 	if err != nil {
-		return fmt.Errorf("Failed to reach API: %v", err)
+		return nil, fmt.Errorf("failed to load .env file: %w", err)
+	}
+
+	return &Config{
+		APIURL:       os.Getenv("API_URL"),
+		TelegramBot:  os.Getenv("TELEGRAM_BOT"),
+		TelegramChat: os.Getenv("TELEGRAM_CHAT"),
+	}, nil
+}
+
+// Fungsi untuk memeriksa healthz endpoint
+func checkHealthz(url string) error {
+	log.Printf("Checking healthz endpoint: %s", url)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to call healthz: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Jika status bukan 200, maka dianggap error
+	// Periksa kode status HTTP
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("API Error: %s, Response: %s", resp.Status, string(body))
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
+
+	// Baca seluruh isi respons
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	log.Printf("Response body: %s", string(bodyBytes))
+
+	// Parse JSON ke struct
+	var healthResp HealthResponse
+	if err := json.Unmarshal(bodyBytes, &healthResp); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Validasi status dari JSON
+	if healthResp.Status != "OK" {
+		return fmt.Errorf("unexpected status value: %s", healthResp.Status)
+	}
+
 	return nil
 }
 
-// sendTelegramMessage sends a message to the Telegram bot
-func sendTelegramMessage(botToken, chatID, message string) {
+// Fungsi untuk mengirim pesan error ke bot Telegram
+func sendTelegramMessage(botToken, chatID, message string) error {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
-	data := fmt.Sprintf(`{"chat_id": "%s", "text": "%s"}`, chatID, message)
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
-	if err != nil {
-		fmt.Printf("Failed to create Telegram request: %v\n", err)
-		return
+	data := map[string]string{
+		"chat_id": chatID,
+		"text":    message,
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	payload, err := json.Marshal(data)
 	if err != nil {
-		fmt.Printf("Failed to send Telegram message: %v\n", err)
-		return
+		return fmt.Errorf("failed to create request payload: %w", err)
+	}
+
+	resp, err := http.Post(url, "application/json", strings.NewReader(string(payload)))
+	// resp, err := http.Post(url, "application/json", io.NopCloser(io.NewReader(payload)))
+	if err != nil {
+		return fmt.Errorf("failed to send telegram message: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		fmt.Printf("Telegram API Error: %s\n", string(body))
+		return fmt.Errorf("unexpected status code from Telegram: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// Fungsi utama
+func main() {
+	// Muat konfigurasi
+	config, err := LoadConfig()
+	if err != nil {
+		log.Fatalf("Error loading config: %v", err)
+	}
+
+	// Loop untuk memantau endpoint setiap 60 detik
+	for {
+		err := checkHealthz(config.APIURL)
+		if err != nil {
+			log.Printf("Health check failed: %v", err)
+
+			// Kirim pesan ke Telegram
+			message := fmt.Sprintf("Health check failed: %v", err)
+			if err := sendTelegramMessage(config.TelegramBot, config.TelegramChat, message); err != nil {
+				log.Printf("Failed to send Telegram message: %v", err)
+			}
+		} else {
+			log.Println("Health check passed.")
+		}
+
+		// Tunggu 60 detik sebelum pengecekan berikutnya
+		time.Sleep(60 * time.Second)
 	}
 }
