@@ -1,0 +1,16 @@
+# Gunakan image Go resmi
+FROM golang:1.20
+
+# Set working directory
+WORKDIR /app
+
+# Copy semua file ke dalam container
+COPY . .
+
+# Unduh dependencies dan build aplikasi
+RUN go mod init monitoring-api-bpjs \
+    && go mod tidy \
+    && go build -o monitoring-api-bpjs .
+
+# Tentukan perintah default saat container dijalankan
+CMD ["./monitoring-api-bpjs"]
